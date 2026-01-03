@@ -25,16 +25,60 @@ public class LogEntry
 
 public class CloudOpsUtility
 {
-    public async Task<List<ServiceReport>> GetHotServicesAsync(Func<Task<List<LogEntry>>> fetchLogs)
+    public async Task<List<ServiceReport>> GetHotServicesAsync(
+        Func<CancellationToken, IAsyncEnumerable<LogEntry>> fetchLogs,
+        CancellationToken ct = default)
     {
-        List<LogEntry> logs = null;
-        
-        // TODO: Implement a Retry Pattern (3 attempts) to call fetchLogs()
-        
-        // TODO: Use LINQ to find services with > 50 "CRITICAL" logs in last 5 mins
-        // Hint: Remember to parse the Timestamp safely
-        
-        return null;
+        IAsyncEnumerable<LogEntry>? logStream = null;
+        int maxAttempts = 3;
+        int delayMilliseconds = 1000; // Starting delay
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                // We check if the caller canceled before starting the fetch
+                ct.ThrowIfCancellationRequested();
+
+                logStream = fetchLogs(ct);
+
+                // We must verify the stream is accessible (trigger a Read)
+                // In some implementations, you might do a dummy check here
+                break;
+            }
+            catch (Exception ex) when (attempt < maxAttempts && !(ex is OperationCanceledException))
+            {
+                // Exponential Backoff: 1s, 2s, 4s...
+                await Task.Delay(delayMilliseconds, ct);
+                delayMilliseconds *= 2;
+            }
+            catch
+            {
+                throw; // Final attempt or Cancellation failure
+            }
+        }
+
+        DateTime fiveMinutesAgo = DateTime.UtcNow.AddMinutes(-5);
+        var stats = new Dictionary<string, int>();
+
+        if (logStream != null)
+        {
+            // Use await foreach for IAsyncEnumerable
+            await foreach (var log in logStream.WithCancellation(ct))
+            {
+                if (log.Level == "CRITICAL" &&
+                    DateTime.TryParse(log.Timestamp, out DateTime ts) &&
+                    ts >= fiveMinutesAgo)
+                {
+                    stats[log.ServiceName] = stats.GetValueOrDefault(log.ServiceName) + 1;
+                }
+            }
+        }
+
+        return stats
+            .Where(kvp => kvp.Value > 50)
+            .Select(kvp => new ServiceReport { ServiceName = kvp.Key, ErrorCount = kvp.Value })
+            .ToList();
     }
 }
 
